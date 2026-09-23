@@ -1,0 +1,143 @@
+name: Publish to Maven Central
+
+# Republishes a GitHub Release's archives as dev.nucleusframework:nucleus.angle-natives,
+# versioned by the Chromium branch number so ANGLE moves on its own cadence
+# rather than Nucleus'.
+#
+# The jar carries the layout NativeLibraryLoader expects, so Nucleus consumes it
+# by declaring the dependency and nothing else.
+#
+# Central is append-only: a version published here can never be replaced. The
+# job therefore refuses to publish a version that already exists, and the
+# release it packages is itself immutable.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Release tag to publish, e.g. angle-8037.
+        required: true
+      dry_run:
+        description: Build and sign the artifacts without uploading them.
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-maven
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: publish
+    runs-on: ubuntu-24.04
+    env:
+      RELEASE_TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.release_tag }}
+    steps:
+      - name: Check out the harness
+        uses: actions/checkout@v5
+
+      - name: Resolve the version
+        id: version
+        run: |
+          set -euo pipefail
+          # angle-8037 -> 8037, angle-8037.2 -> 8037.2
+          version="${RELEASE_TAG#angle-}"
+          if [[ ! "$version" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+            echo "::error::$RELEASE_TAG does not name an ANGLE release"
+            exit 1
+          fi
+
+          url="https://repo1.maven.org/maven2/dev/nucleusframework/nucleus.angle-natives/$version/"
+          if curl -fsSL -o /dev/null "$url" 2>/dev/null; then
+            echo "::error::$version is already on Maven Central, which is append-only"
+            exit 1
+          fi
+
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Download the release archives
+        run: |
+          set -euo pipefail
+          mkdir -p archives
+          gh release download "$RELEASE_TAG" --pattern '*.zip' --pattern 'SHA256SUMS.txt' -D archives
+          (cd archives && sha256sum -c SHA256SUMS.txt)
+        env:
+          GH_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Stage the natives
+        id: stage
+        run: |
+          set -euo pipefail
+          res="publishing/src/main/resources/nucleus/native"
+          mkdir -p "$res/win32-x64" "$res/win32-aarch64"
+
+          # win32-arm64 is the release's name for the architecture; win32-aarch64
+          # is the directory name NativeLibraryLoader resolves at runtime.
+          unzip -j -o "archives/${RELEASE_TAG}-win32-x64.zip" libEGL.dll libGLESv2.dll -d "$res/win32-x64"
+          unzip -j -o "archives/${RELEASE_TAG}-win32-arm64.zip" libEGL.dll libGLESv2.dll -d "$res/win32-aarch64"
+
+          # Provenance travels with the binaries: the upstream licence, and the
+          # manifest recording the ANGLE commit and full GN argument list.
+          meta="publishing/src/main/resources/META-INF"
+          mkdir -p "$meta/nucleus"
+          unzip -p "archives/${RELEASE_TAG}-win32-x64.zip" LICENSE > "$meta/LICENSE.angle"
+          for arch in x64 arm64; do
+            unzip -p "archives/${RELEASE_TAG}-win32-$arch.zip" angle-build.json \
+              > "$meta/nucleus/angle-build-win32-$arch.json"
+          done
+
+          commit="$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['angleCommit'])" \
+            "$meta/nucleus/angle-build-win32-x64.json")"
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+
+          find publishing/src/main/resources -type f -printf '%10s  %p\n'
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "9.4"
+
+      - name: Publish
+        working-directory: publishing
+        run: |
+          set -euo pipefail
+          if [ "${DRY_RUN}" = "true" ]; then
+            task=publishToMavenLocal
+          else
+            task=publishAndReleaseToMavenCentral
+          fi
+          gradle --no-daemon "$task" \
+            -PangleVersion="${{ steps.version.outputs.version }}" \
+            -PangleCommit="${{ steps.stage.outputs.commit }}"
+        env:
+          DRY_RUN: ${{ inputs.dry_run || 'false' }}
+          ORG_GRADLE_PROJECT_mavenCentralUsername: ${{ secrets.MAVENCENTRALUSERNAME }}
+          ORG_GRADLE_PROJECT_mavenCentralPassword: ${{ secrets.MAVENCENTRALPASSWORD }}
+          ORG_GRADLE_PROJECT_signingInMemoryKey: ${{ secrets.SIGNINGINMEMORYKEY }}
+          ORG_GRADLE_PROJECT_signingInMemoryKeyId: ${{ secrets.SIGNINGKEYID }}
+          ORG_GRADLE_PROJECT_signingInMemoryKeyPassword: ${{ secrets.SIGNINGPASSWORD }}
+
+      - name: Summary
+        run: |
+          {
+            echo "## Published"
+            echo
+            echo '```'
+            echo 'dev.nucleusframework:nucleus.angle-natives:${{ steps.version.outputs.version }}'
+            echo '```'
+            echo
+            echo "ANGLE commit \`${{ steps.stage.outputs.commit }}\`, from release \`$RELEASE_TAG\`."
+          } >> "$GITHUB_STEP_SUMMARY"

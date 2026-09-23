@@ -1,0 +1,7 @@
+[versions]
+# Kept in step with Nucleus' own gradle/libs.versions.toml, so both projects
+# publish through the same plugin.
+vanniktechMavenPublish = "0.37.0"
+
+[plugins]
+vanniktechMavenPublish = { id = "com.vanniktech.maven.publish", version.ref = "vanniktechMavenPublish" }

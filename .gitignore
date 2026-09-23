@@ -1,1 +1,4 @@
 __pycache__/
+publishing/src/main/resources/
+publishing/.gradle/
+publishing/build/

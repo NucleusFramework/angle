@@ -5,7 +5,7 @@
 // Nucleus'. A merge-back rebuild of the same branch becomes 8037.2, which
 // orders after 8037 for both Gradle and Maven.
 //
-// The workflow stages the archives into src/main/resources, in the layout
+// The workflow stages the archives into staging/, in the layout
 // NativeLibraryLoader looks for, so Nucleus consumes this by declaring the
 // dependency and nothing else: Class.getResource resolves through the
 // classloader, which sees every jar on the classpath.
@@ -30,7 +30,12 @@ val angleCommit: String = providers.gradleProperty("angleCommit").getOrElse("")
 version = angleVersion
 group = "dev.nucleusframework"
 
+// Staged by the workflow from the release archives. Deliberately not
+// src/main/resources: `allSource` feeds the sources jar, which would then carry
+// a second 11 MB copy of the DLLs. There are no sources here at all -- they live
+// on this repository's chromium/<version> branch, which the POM's scm names.
 tasks.jar {
+    from(layout.projectDirectory.dir("staging"))
     manifest {
         attributes(
             "Implementation-Title" to "ANGLE runtime (Direct3D 11) for Nucleus",

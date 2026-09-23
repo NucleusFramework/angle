@@ -75,7 +75,7 @@ jobs:
         id: stage
         run: |
           set -euo pipefail
-          res="publishing/src/main/resources/nucleus/native"
+          res="publishing/staging/nucleus/native"
           mkdir -p "$res/win32-x64" "$res/win32-aarch64"
 
           # win32-arm64 is the release's name for the architecture; win32-aarch64
@@ -85,7 +85,7 @@ jobs:
 
           # Provenance travels with the binaries: the upstream licence, and the
           # manifest recording the ANGLE commit and full GN argument list.
-          meta="publishing/src/main/resources/META-INF"
+          meta="publishing/staging/META-INF"
           mkdir -p "$meta/nucleus"
           unzip -p "archives/${RELEASE_TAG}-win32-x64.zip" LICENSE > "$meta/LICENSE.angle"
           for arch in x64 arm64; do
@@ -97,7 +97,7 @@ jobs:
             "$meta/nucleus/angle-build-win32-x64.json")"
           echo "commit=$commit" >> "$GITHUB_OUTPUT"
 
-          find publishing/src/main/resources -type f -printf '%10s  %p\n'
+          find publishing/staging -type f -printf '%10s  %p\n'
 
       - name: Set up Java
         uses: actions/setup-java@v4

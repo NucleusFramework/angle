@@ -231,6 +231,11 @@ jobs:
             /link /LIBPATH:"angle\out\Release" libEGL.dll.lib libGLESv2.dll.lib || exit /b 1
           cd /d "%RUNNER_TEMP%\smoke" && smoke.exe || exit /b 1
 
+
+  # One job for both destinations: the GitHub Release is the provenance record
+  # (archives, checksums, build metadata, downloadable without a build tool) and
+  # Maven Central is how Nucleus consumes it. They ship the same bytes, so they
+  # are published together or not at all.
   release:
     name: release
     needs: [resolve, build]
@@ -239,6 +244,9 @@ jobs:
     permissions:
       contents: write
     steps:
+      - name: Check out the harness
+        uses: actions/checkout@v5
+
       - name: Download the archives
         uses: actions/download-artifact@v4
         with:
@@ -252,8 +260,8 @@ jobs:
           set -euo pipefail
           sha256sum *.zip | tee SHA256SUMS.txt
 
-      # Releases are immutable: a published tag's bytes never change, because
-      # consumers pin their SHA-256. A merge-back advances chromium/NNNN without
+      # Published bytes never change, because consumers pin their SHA-256 and
+      # Maven Central is append-only. A merge-back advances chromium/NNNN without
       # changing NNNN, so a rebuild of the same branch takes the next free
       # revision suffix rather than overwriting what is already out there.
       - name: Resolve the release tag
@@ -272,22 +280,24 @@ jobs:
           revision=1
           while gh release view "$tag" >/dev/null 2>&1; do
             if [ "$(released_commit "$tag")" = "$commit" ]; then
-              echo "::notice::$tag already publishes $commit; nothing to do"
+              echo "::notice::$tag already publishes $commit"
               echo "skip=true" >> "$GITHUB_OUTPUT"
+              echo "version=${tag#angle-}" >> "$GITHUB_OUTPUT"
               exit 0
             fi
             revision=$((revision + 1))
             tag="$base.$revision"
           done
 
-          echo "Publishing as $tag"
+          echo "Releasing as $tag"
           echo "skip=false" >> "$GITHUB_OUTPUT"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=${tag#angle-}" >> "$GITHUB_OUTPUT"
         env:
           GH_REPO: ${{ github.repository }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Publish
+      - name: Publish the GitHub Release
         if: ${{ steps.tag.outputs.skip == 'false' }}
         working-directory: dist
         run: |
@@ -296,15 +306,21 @@ jobs:
           notes="$(cat <<EOF
           Direct3D 11-only ANGLE runtime for the Nucleus Tao Windows backend.
 
+          Consumed from Maven Central as:
+
+          \`\`\`
+          dev.nucleusframework:nucleus.angle-natives:${{ steps.tag.outputs.version }}
+          \`\`\`
+
           | | |
           | --- | --- |
           | ANGLE branch | \`${{ needs.resolve.outputs.branch }}\` |
           | ANGLE commit | \`${{ needs.resolve.outputs.commit }}\` |
           | Chrome stable | ${{ needs.resolve.outputs.chrome_version || 'not the branch stable ships' }} |
 
-          The Vulkan, desktop-GL/WGL, D3D9, SwiftShader, WebGPU and OpenCL
-          backends are disabled at the GN level; see \`angle-build.json\` in each
-          archive for the full argument list and per-file SHA-256.
+          The Vulkan, desktop-GL/WGL, SwiftShader, WebGPU and OpenCL backends are
+          disabled at the GN level; see \`angle-build.json\` in each archive for the
+          full argument list and per-file SHA-256.
 
           \`\`\`
           $(cat SHA256SUMS.txt)
@@ -315,3 +331,80 @@ jobs:
         env:
           GH_REPO: ${{ github.repository }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Stage the natives for Maven
+        id: stage
+        run: |
+          set -euo pipefail
+          version="${{ steps.tag.outputs.version }}"
+          if curl -fsSL -o /dev/null \
+            "https://repo1.maven.org/maven2/dev/nucleusframework/nucleus.angle-natives/$version/"; then
+            echo "::notice::$version is already on Maven Central, which is append-only"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          res="publishing/staging/nucleus/native"
+          meta="publishing/staging/META-INF"
+          mkdir -p "$res/win32-x64" "$res/win32-aarch64" "$meta/nucleus"
+
+          # Resolved by glob rather than from the tag: a .N revision keeps the
+          # archive names of the branch it rebuilds. win32-arm64 is the release's
+          # name for the architecture, win32-aarch64 the directory name
+          # NativeLibraryLoader resolves at runtime.
+          x64_zip="$(echo dist/*-win32-x64.zip)"
+          arm64_zip="$(echo dist/*-win32-arm64.zip)"
+          unzip -j -o "$x64_zip" libEGL.dll libGLESv2.dll -d "$res/win32-x64"
+          unzip -j -o "$arm64_zip" libEGL.dll libGLESv2.dll -d "$res/win32-aarch64"
+
+          # Provenance travels with the binaries: the upstream licence, and the
+          # manifest recording the ANGLE commit and full GN argument list.
+          unzip -p "$x64_zip" LICENSE > "$meta/LICENSE.angle"
+          unzip -p "$x64_zip" angle-build.json > "$meta/nucleus/angle-build-win32-x64.json"
+          unzip -p "$arm64_zip" angle-build.json > "$meta/nucleus/angle-build-win32-arm64.json"
+
+          find publishing/staging -type f -printf '%10s  %p\n'
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Java
+        if: ${{ steps.stage.outputs.skip == 'false' }}
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Set up Gradle
+        if: ${{ steps.stage.outputs.skip == 'false' }}
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          # The exact release name, matching Nucleus' own wrapper. "9.4" is not
+          # a published distribution and the action rejects it.
+          gradle-version: "9.4.0"
+
+      - name: Publish to Maven Central
+        if: ${{ steps.stage.outputs.skip == 'false' }}
+        working-directory: publishing
+        run: |
+          set -euo pipefail
+          gradle --no-daemon publishAndReleaseToMavenCentral \
+            -PangleVersion="${{ steps.tag.outputs.version }}" \
+            -PangleCommit="${{ needs.resolve.outputs.commit }}"
+        env:
+          ORG_GRADLE_PROJECT_mavenCentralUsername: ${{ secrets.MAVENCENTRALUSERNAME }}
+          ORG_GRADLE_PROJECT_mavenCentralPassword: ${{ secrets.MAVENCENTRALPASSWORD }}
+          ORG_GRADLE_PROJECT_signingInMemoryKey: ${{ secrets.SIGNINGINMEMORYKEY }}
+          ORG_GRADLE_PROJECT_signingInMemoryKeyId: ${{ secrets.SIGNINGKEYID }}
+          ORG_GRADLE_PROJECT_signingInMemoryKeyPassword: ${{ secrets.SIGNINGPASSWORD }}
+
+      - name: Summary
+        run: |
+          {
+            echo "## ${{ steps.tag.outputs.tag || 'angle-' }}${{ steps.tag.outputs.version }}"
+            echo
+            echo "| | |"
+            echo "| --- | --- |"
+            echo "| GitHub Release | ${{ steps.tag.outputs.skip == 'true' && 'already published' || 'created' }} |"
+            echo "| Maven Central | ${{ steps.stage.outputs.skip == 'true' && 'already published' || 'published' }} |"
+            echo "| Coordinates | \`dev.nucleusframework:nucleus.angle-natives:${{ steps.tag.outputs.version }}\` |"
+            echo "| ANGLE commit | \`${{ needs.resolve.outputs.commit }}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"

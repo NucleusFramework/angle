@@ -300,7 +300,7 @@ jobs:
           | --- | --- |
           | ANGLE branch | \`${{ needs.resolve.outputs.branch }}\` |
           | ANGLE commit | \`${{ needs.resolve.outputs.commit }}\` |
-          | Chrome stable | ${{ needs.resolve.outputs.chrome_version }} |
+          | Chrome stable | ${{ needs.resolve.outputs.chrome_version || 'not the branch stable ships' }} |
 
           The Vulkan, desktop-GL/WGL, D3D9, SwiftShader, WebGPU and OpenCL
           backends are disabled at the GN level; see \`angle-build.json\` in each

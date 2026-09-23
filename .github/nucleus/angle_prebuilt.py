@@ -164,12 +164,13 @@ def cmd_resolve_ref(args):
     `chromium/BBBB` branch at the same point -- so this picks the ANGLE revision
     that has been through a full Chrome stable cycle rather than today's main.
     """
-    if args.branch:
-        branch = args.branch
-        version = ""
-    else:
-        version = fetch_stable_chrome_version()
-        branch = f"chromium/{version.split('.')[2]}"
+    stable = fetch_stable_chrome_version()
+    stable_branch = f"chromium/{stable.split('.')[2]}"
+
+    branch = args.branch or stable_branch
+    # Only claim a Chrome version for the branch it was actually cut from: an
+    # explicitly requested older branch is not what stable ships today.
+    version = stable if branch == stable_branch else ""
 
     output = subprocess.check_output(
         ["git", "ls-remote", "--heads", ANGLE_GIT_URL, f"refs/heads/{branch}"],

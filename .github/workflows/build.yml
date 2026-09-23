@@ -313,22 +313,7 @@ jobs:
           the whole integration.
 
           \`\`\`kotlin
-          // Gradle (Kotlin DSL)
           implementation("dev.nucleusframework:nucleus.angle-natives:${{ steps.tag.outputs.version }}")
-          \`\`\`
-
-          \`\`\`groovy
-          // Gradle (Groovy DSL)
-          implementation 'dev.nucleusframework:nucleus.angle-natives:${{ steps.tag.outputs.version }}'
-          \`\`\`
-
-          \`\`\`xml
-          <!-- Maven -->
-          <dependency>
-            <groupId>dev.nucleusframework</groupId>
-            <artifactId>nucleus.angle-natives</artifactId>
-            <version>${{ steps.tag.outputs.version }}</version>
-          </dependency>
           \`\`\`
 
           ## Provenance

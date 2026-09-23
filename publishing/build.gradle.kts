@@ -30,6 +30,15 @@ val angleCommit: String = providers.gradleProperty("angleCommit").getOrElse("")
 version = angleVersion
 group = "dev.nucleusframework"
 
+java {
+    // There is no bytecode in this jar, only DLLs. Left alone, Gradle stamps
+    // org.gradle.jvm.version with the JDK that happened to build it (21 on CI)
+    // and then refuses to hand the artifact to anything targeting less -- which
+    // includes Nucleus, on 17. A resources-only artifact must constrain nobody.
+    sourceCompatibility = JavaVersion.VERSION_1_8
+    targetCompatibility = JavaVersion.VERSION_1_8
+}
+
 // Staged by the workflow from the release archives. Deliberately not
 // src/main/resources: `allSource` feeds the sources jar, which would then carry
 // a second 11 MB copy of the DLLs. There are no sources here at all -- they live

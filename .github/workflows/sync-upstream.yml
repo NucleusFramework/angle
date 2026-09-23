@@ -1,0 +1,98 @@
+name: Sync upstream
+
+# Keeps this fork current with google/angle, and makes sure it carries the ANGLE
+# release branch that stable Chrome was cut from.
+#
+# The harness lives on the orphan `nucleus` branch, so `main` and every
+# `chromium/NNNN` branch stay untouched mirrors: syncing them is a fast-forward
+# that can never conflict. A fork also shares its parent's object store, so all
+# of this is refs API calls -- there is nothing to fetch or push.
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: ANGLE release branch to mirror (empty = the one stable Chrome ships).
+        required: false
+        default: ""
+      build:
+        description: Dispatch a build once the branch is in place.
+        type: boolean
+        required: false
+        default: true
+  schedule:
+    # Monthly: release branches only move for merge-backs, and Chrome's stable
+    # branch number only changes every few weeks.
+    - cron: "0 3 1 * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: sync
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write # Fast-forward main and the release branch
+      actions: write # Dispatch the build workflow
+    steps:
+      - name: Check out the harness
+        uses: actions/checkout@v5
+
+      - name: Fast-forward main from upstream
+        run: |
+          set -euo pipefail
+          # The same call the repository's "Sync fork" button makes. Nothing of
+          # ours lives on main, so this is always a clean fast-forward.
+          gh api --method POST "repos/$GH_REPO/merge-upstream" -f branch=main \
+            --jq '"main: " + .merge_type + " -- " + .message'
+        env:
+          GH_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve the ANGLE release branch
+        id: resolve
+        run: python3 .github/nucleus/angle_prebuilt.py resolve-ref --branch "$BRANCH"
+        env:
+          BRANCH: ${{ inputs.branch }}
+
+      - name: Point this fork at it
+        id: mirror
+        run: |
+          set -euo pipefail
+          ref="heads/${BRANCH}"
+          current="$(gh api "repos/$GH_REPO/git/ref/$ref" --jq .object.sha 2>/dev/null || true)"
+
+          if [ "$current" = "$COMMIT" ]; then
+            echo "$BRANCH is already at $COMMIT"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ -z "$current" ]; then
+            gh api "repos/$GH_REPO/git/refs" -f "ref=refs/$ref" -f "sha=$COMMIT" >/dev/null
+            echo "Created $BRANCH at $COMMIT"
+          else
+            # Not forced: a release branch that cannot fast-forward means upstream
+            # rewrote history, which is worth looking at rather than clobbering.
+            gh api --method PATCH "repos/$GH_REPO/git/refs/$ref" -f "sha=$COMMIT" -F force=false >/dev/null
+            echo "Advanced $BRANCH from $current to $COMMIT"
+          fi
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+        env:
+          GH_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BRANCH: ${{ steps.resolve.outputs.branch }}
+          COMMIT: ${{ steps.resolve.outputs.commit }}
+
+      - name: Dispatch a build
+        if: ${{ steps.mirror.outputs.changed == 'true' && (github.event_name == 'schedule' || inputs.build) }}
+        run: gh workflow run build.yml --field angle_ref="$BRANCH"
+        env:
+          GH_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BRANCH: ${{ steps.resolve.outputs.branch }}

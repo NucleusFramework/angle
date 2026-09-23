@@ -1,0 +1,283 @@
+name: Build
+
+# Builds the trimmed ANGLE runtime DLLs that Nucleus' Tao Windows backend ships.
+#
+# Two checkouts: the ANGLE source at the release branch being built, and the
+# harness (.github/nucleus) from the default branch. Keeping them apart is what
+# lets the release branch stay a clean mirror of upstream.
+
+on:
+  workflow_dispatch:
+    inputs:
+      angle_ref:
+        description: ANGLE branch to build, e.g. chromium/8037 (empty = the one stable Chrome ships).
+        required: false
+        default: ""
+      release:
+        description: Publish a GitHub Release with the archives.
+        type: boolean
+        required: false
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ inputs.angle_ref }}
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    name: resolve
+    runs-on: ubuntu-24.04
+    outputs:
+      branch: ${{ steps.resolve.outputs.branch }}
+      commit: ${{ steps.resolve.outputs.commit }}
+      position: ${{ steps.resolve.outputs.position }}
+      chrome_version: ${{ steps.resolve.outputs.chrome_version }}
+    steps:
+      - uses: actions/checkout@v5
+      - id: resolve
+        run: python3 .github/nucleus/angle_prebuilt.py resolve-ref --branch "$BRANCH"
+        env:
+          BRANCH: ${{ inputs.angle_ref }}
+
+  build:
+    name: ${{ matrix.arch }}
+    needs: resolve
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            runner: windows-2022
+          - arch: arm64
+            # Built natively so the smoke test can actually run the DLLs.
+            runner: windows-11-arm
+    env:
+      # DEPOT_TOOLS_UPDATE stays on: the Windows bootstrap is what installs the
+      # bundled git and CIPD client that gclient shells out to.
+      DEPOT_TOOLS_WIN_TOOLCHAIN: "0"
+      GYP_MSVS_VERSION: "2022"
+      ARCHIVE: angle-${{ needs.resolve.outputs.position }}-win32-${{ matrix.arch }}.zip
+    steps:
+      - name: Check out ANGLE at the release branch
+        uses: actions/checkout@v5
+        with:
+          path: angle
+          ref: ${{ needs.resolve.outputs.commit }}
+          fetch-depth: 1
+
+      - name: Check out the harness
+        uses: actions/checkout@v5
+        with:
+          path: harness
+          sparse-checkout: .github/nucleus
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install depot_tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Before the clone, not after: GitHub's Windows images default to
+          # core.autocrlf=true, which rewrites depot_tools' POSIX wrappers and
+          # its cipd_client_version.digests, leaving the CIPD bootstrap unable
+          # to match any pinned hash and gclient unable to find git.
+          git config --global core.autocrlf false
+          git config --global core.filemode false
+          git config --global core.fscache true
+          git config --global core.preloadindex true
+          git config --global depot-tools.allowGlobalGitConfig false
+
+          git clone --depth 1 \
+            https://chromium.googlesource.com/chromium/tools/depot_tools.git \
+            "$RUNNER_TEMP/depot_tools"
+          echo "$RUNNER_TEMP/depot_tools" >> "$GITHUB_PATH"
+
+      - name: Bootstrap depot_tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          # First invocation downloads the bundled git, python and CIPD client.
+          gclient version
+
+      - name: Configure gclient
+        shell: bash
+        run: |
+          set -euo pipefail
+          # `managed: false` leaves the checkout above alone; gclient only
+          # resolves DEPS. The custom vars drop the Dawn/OpenCL/trace corpora,
+          # which are gigabytes we would never compile.
+          cat > "$GITHUB_WORKSPACE/.gclient" <<'PY'
+          solutions = [
+            {
+              "name": "angle",
+              "url": "https://github.com/google/angle.git",
+              "deps_file": "DEPS",
+              "managed": False,
+              "custom_vars": {
+                "checkout_angle_cl_deps": False,
+                "checkout_angle_dawn_deps": False,
+                "checkout_angle_internal": False,
+                "checkout_angle_mesa": False,
+                "checkout_angle_restricted_traces": False,
+              },
+            },
+          ]
+          PY
+
+      - name: Sync ANGLE dependencies
+        shell: bash
+        working-directory: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3; do
+            if gclient sync --no-history --shallow --delete_unversioned_trees --reset --jobs 8; then
+              exit 0
+            fi
+            echo "gclient sync attempt $attempt failed"
+            sleep $((attempt * 30))
+          done
+          echo "::error::gclient sync failed three times"
+          exit 1
+
+      - name: Prepare the Windows toolchain
+        shell: bash
+        working-directory: angle
+        run: python3 "$GITHUB_WORKSPACE/harness/.github/nucleus/angle_prebuilt.py" prepare-toolchain --source-root . --arch "${{ matrix.arch }}"
+
+      - name: Generate GN args
+        shell: bash
+        working-directory: angle
+        run: |
+          set -euo pipefail
+          python3 "$GITHUB_WORKSPACE/harness/.github/nucleus/angle_prebuilt.py" gn-args \
+            --arch "${{ matrix.arch }}" \
+            --output out/Release/args.gn \
+            --json-output "$RUNNER_TEMP/gn-args.json"
+          {
+            echo '## args.gn (`${{ matrix.arch }}`)'
+            echo '```gn'
+            cat out/Release/args.gn
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Build libEGL and libGLESv2
+        shell: bash
+        working-directory: angle
+        run: |
+          set -euo pipefail
+          gn gen out/Release
+          autoninja -C out/Release libEGL libGLESv2
+
+      - name: Package
+        shell: bash
+        working-directory: angle
+        run: |
+          set -euo pipefail
+          python3 "$GITHUB_WORKSPACE/harness/.github/nucleus/angle_prebuilt.py" package \
+            --build-dir out/Release \
+            --source-root . \
+            --staging "$RUNNER_TEMP/staging" \
+            --output "$GITHUB_WORKSPACE/dist/$ARCHIVE" \
+            --arch "${{ matrix.arch }}" \
+            --branch "${{ needs.resolve.outputs.branch }}" \
+            --commit "${{ needs.resolve.outputs.commit }}" \
+            --chrome-version "${{ needs.resolve.outputs.chrome_version }}" \
+            --gn-args-json "$RUNNER_TEMP/gn-args.json"
+
+      - name: Verify
+        shell: bash
+        run: python3 "$GITHUB_WORKSPACE/harness/.github/nucleus/angle_prebuilt.py" verify --archive "dist/$ARCHIVE" --arch "${{ matrix.arch }}"
+
+      # Before the smoke test, not after: a failed smoke test is exactly when the
+      # archive is worth having. The release job only runs once every build job
+      # has succeeded, so nothing gets published on the strength of the upload.
+      - name: Upload the archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: angle-win32-${{ matrix.arch }}
+          path: dist/${{ env.ARCHIVE }}
+          if-no-files-found: error
+
+      - name: Locate the MSVC toolchain
+        id: msvc
+        shell: bash
+        run: |
+          set -euo pipefail
+          vswhere="/c/Program Files (x86)/Microsoft Visual Studio/Installer/vswhere.exe"
+          install="$("$vswhere" -latest -products '*' -property installationPath | tr -d '\r')"
+          echo "vcvarsall=$install\\VC\\Auxiliary\\Build\\vcvarsall.bat" >> "$GITHUB_OUTPUT"
+
+      - name: Smoke test the packaged DLLs
+        shell: cmd
+        run: |
+          call "${{ steps.msvc.outputs.vcvarsall }}" ${{ matrix.arch }} || exit /b 1
+          mkdir "%RUNNER_TEMP%\smoke" || exit /b 1
+          rem Runs against the archive's own DLLs, in a directory holding nothing
+          rem else, so anything the build dir happened to provide is missing here.
+          tar -xf "dist\%ARCHIVE%" -C "%RUNNER_TEMP%\smoke" libEGL.dll libGLESv2.dll || exit /b 1
+          cl /nologo /std:c++17 /EHsc /O2 ^
+            /I angle\include ^
+            harness\.github\nucleus\smoke.cpp ^
+            /Fe:"%RUNNER_TEMP%\smoke\smoke.exe" ^
+            /Fo:"%RUNNER_TEMP%\smoke\\" ^
+            /link /LIBPATH:"angle\out\Release" libEGL.dll.lib libGLESv2.dll.lib || exit /b 1
+          cd /d "%RUNNER_TEMP%\smoke" && smoke.exe || exit /b 1
+
+  release:
+    name: release
+    needs: [resolve, build]
+    if: ${{ inputs.release }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download the archives
+        uses: actions/download-artifact@v4
+        with:
+          pattern: angle-win32-*
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          sha256sum *.zip | tee SHA256SUMS.txt
+
+      - name: Publish
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          tag="angle-${{ needs.resolve.outputs.position }}"
+          notes="$(cat <<EOF
+          Direct3D 11-only ANGLE runtime for the Nucleus Tao Windows backend.
+
+          | | |
+          | --- | --- |
+          | ANGLE branch | \`${{ needs.resolve.outputs.branch }}\` |
+          | ANGLE commit | \`${{ needs.resolve.outputs.commit }}\` |
+          | Chrome stable | ${{ needs.resolve.outputs.chrome_version }} |
+
+          The Vulkan, desktop-GL/WGL, D3D9, SwiftShader, WebGPU and OpenCL
+          backends are disabled at the GN level; see \`angle-build.json\` in each
+          archive for the full argument list and per-file SHA-256.
+
+          \`\`\`
+          $(cat SHA256SUMS.txt)
+          \`\`\`
+          EOF
+          )"
+          gh release create "$tag" *.zip SHA256SUMS.txt \
+            --title "$tag" --notes "$notes" || \
+          gh release upload "$tag" *.zip SHA256SUMS.txt --clobber
+        env:
+          GH_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

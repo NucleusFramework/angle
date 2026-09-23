@@ -252,11 +252,47 @@ jobs:
           set -euo pipefail
           sha256sum *.zip | tee SHA256SUMS.txt
 
+      # Releases are immutable: a published tag's bytes never change, because
+      # consumers pin their SHA-256. A merge-back advances chromium/NNNN without
+      # changing NNNN, so a rebuild of the same branch takes the next free
+      # revision suffix rather than overwriting what is already out there.
+      - name: Resolve the release tag
+        id: tag
+        run: |
+          set -euo pipefail
+          base="angle-${{ needs.resolve.outputs.position }}"
+          commit="${{ needs.resolve.outputs.commit }}"
+
+          released_commit() {
+            gh release view "$1" --json body --jq .body 2>/dev/null |
+              grep -oE '[0-9a-f]{40}' | head -1 || true
+          }
+
+          tag="$base"
+          revision=1
+          while gh release view "$tag" >/dev/null 2>&1; do
+            if [ "$(released_commit "$tag")" = "$commit" ]; then
+              echo "::notice::$tag already publishes $commit; nothing to do"
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            revision=$((revision + 1))
+            tag="$base.$revision"
+          done
+
+          echo "Publishing as $tag"
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+        env:
+          GH_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Publish
+        if: ${{ steps.tag.outputs.skip == 'false' }}
         working-directory: dist
         run: |
           set -euo pipefail
-          tag="angle-${{ needs.resolve.outputs.position }}"
+          tag="${{ steps.tag.outputs.tag }}"
           notes="$(cat <<EOF
           Direct3D 11-only ANGLE runtime for the Nucleus Tao Windows backend.
 
@@ -275,9 +311,7 @@ jobs:
           \`\`\`
           EOF
           )"
-          gh release create "$tag" *.zip SHA256SUMS.txt \
-            --title "$tag" --notes "$notes" || \
-          gh release upload "$tag" *.zip SHA256SUMS.txt --clobber
+          gh release create "$tag" *.zip SHA256SUMS.txt --title "$tag" --notes "$notes"
         env:
           GH_REPO: ${{ github.repository }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
